@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::block_size_oracle::BlockSizeOracle;
-use super::bootstrap::{PeerSnapshot, WireWorker, SNAPSHOT_FORMAT};
+use super::bootstrap::{PeerRegistry, PeerSnapshot, WireWorker, SNAPSHOT_FORMAT};
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 use super::tally::{EventKind, EventTally};
@@ -209,6 +209,8 @@ pub struct KvEventIndex {
     /// Applied events by kind and storage medium, for the `/metrics` scrape.
     /// Written only by the pump.
     tally: Arc<EventTally>,
+    /// Sibling replicas a snapshot may be pulled from. See [`PeerRegistry`].
+    peers: Arc<PeerRegistry>,
     /// Last built snapshot; see [`KvEventIndex::peer_snapshot_body`].
     snapshot_cache: Arc<AsyncMutex<Option<CachedSnapshot>>>,
     /// Worker-sourced `page_size` shared with prefix providers.
@@ -293,6 +295,7 @@ impl KvEventIndex {
             live_workers,
             cursors,
             tally,
+            peers: Arc::new(PeerRegistry::new()),
             snapshot_cache: Arc::new(AsyncMutex::new(None)),
             block_size_oracle,
         })
@@ -324,6 +327,11 @@ impl KvEventIndex {
             tree: Arc::clone(&self.tree),
             tally: Arc::clone(&self.tally),
         })
+    }
+
+    /// Shared handle to the peer registry.
+    pub fn peers(&self) -> Arc<PeerRegistry> {
+        Arc::clone(&self.peers)
     }
 
     /// This replica as a bootstrap source. `None` in metadata-only mode,
