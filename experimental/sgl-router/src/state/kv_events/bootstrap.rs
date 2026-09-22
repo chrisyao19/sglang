@@ -129,7 +129,10 @@ pub enum SnapshotOutcome {
     /// Peer did not answer, or answered non-200 (including the 404 an older
     /// router image returns for an endpoint it does not serve).
     Unreachable,
-    /// Answered, but holds no state to graft.
+    /// Answered, but holds no state to graft for the ranks being bootstrapped.
+    /// That includes WARM peers whose tree shares no carriers with our live
+    /// workers or tracks none of those ranks, so this is not
+    /// [`PeerSnapshot::is_cold`] and does not count toward a cold-fleet verdict.
     ColdPeer,
     /// Answered with an untrustworthy body: any [`VetError`] whose
     /// [`VetError::outcome`] is `Rejected`.
@@ -423,6 +426,15 @@ impl VettedSnapshot {
     /// Wire workers this replica does not know; see the field docs.
     pub fn dropped_workers(&self) -> usize {
         self.dropped_workers
+    }
+
+    /// `(carried, structure)`: nodes with at least one surviving carrier vs
+    /// carrier-less interior kept on a path to a carried descendant. Structure
+    /// nodes cannot answer a query but can turn one into a hit-shaped miss, so
+    /// their count is surfaced rather than buried inside `node_count`.
+    pub(crate) fn carrier_counts(&self) -> (usize, usize) {
+        let structure = self.nodes.iter().filter(|n| n.workers.is_empty()).count();
+        (self.nodes.len() - structure, structure)
     }
 
     /// Graft this snapshot's nodes into `tree`, returning how many were applied.
@@ -880,9 +892,15 @@ impl BootstrapTracker {
         self.fetch_cap
     }
 
-    /// Register ranks as `Pending` and return the obligation set: each rank
-    /// paired with the incarnation number a later control message must still
-    /// match to be allowed to act on it.
+    /// Register ranks as `Pending` and return obligations for the ones newly
+    /// inserted: each paired with a freshly minted incarnation number a later
+    /// control message must still match to be allowed to act on it.
+    ///
+    /// A rank already registered keeps its state and incarnation and yields no
+    /// obligation: whoever holds its existing obligation owns it. Decided under
+    /// the `states` lock, so concurrent callers registering the same rank get
+    /// exactly one obligation between them. A rank [`Self::forget`] removed is
+    /// new again and gets a new incarnation.
     ///
     /// Ranks added after the tracker has latched are recorded (so metrics stay
     /// accurate) but cannot un-settle readiness. The first registration is not
@@ -903,23 +921,12 @@ impl BootstrapTracker {
         let mut epochs = self.epochs.lock();
         let mut obligations = Vec::with_capacity(ids.len());
         for id in ids {
-            let fresh = !states.contains_key(id);
-            states.entry(id.clone()).or_insert(BootstrapState::Pending);
-            // A rank still present keeps its incarnation; one that was
-            // forgotten gets a new one, so a result started for the previous
-            // incarnation is recognisably stale.
-            let epoch = if fresh {
-                let e = self.epoch_seq.fetch_add(1, Ordering::Relaxed) + 1;
-                epochs.insert(id.clone(), e);
-                e
-            } else {
-                // A registered rank always has an epoch (`register` and `forget`
-                // write both maps together). Mint rather than default to 0 so a
-                // future asymmetry cannot make two incarnations share a number.
-                *epochs
-                    .entry(id.clone())
-                    .or_insert_with(|| self.epoch_seq.fetch_add(1, Ordering::Relaxed) + 1)
-            };
+            if states.contains_key(id) {
+                continue;
+            }
+            states.insert(id.clone(), BootstrapState::Pending);
+            let epoch = self.epoch_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            epochs.insert(id.clone(), epoch);
             obligations.push((id.clone(), epoch));
         }
         obligations
@@ -1596,9 +1603,17 @@ mod tests {
         let first = t.register(std::slice::from_ref(&a));
         let e1 = first[0].1;
 
-        // Re-registering a still-present rank keeps its incarnation.
-        let again = t.register(std::slice::from_ref(&a));
-        assert_eq!(again[0].1, e1, "a live rank keeps its incarnation");
+        // Re-registering a still-present rank yields no obligation and keeps
+        // its incarnation.
+        assert!(
+            t.register(std::slice::from_ref(&a)).is_empty(),
+            "a registered rank's obligation is already held",
+        );
+        assert_eq!(
+            t.epoch_of(&a),
+            Some(e1),
+            "a live rank keeps its incarnation"
+        );
 
         t.forget(std::slice::from_ref(&a));
         assert_eq!(t.epoch_of(&a), None);
@@ -1714,6 +1729,28 @@ mod tests {
         for (i, rec) in vetted.nodes.iter().enumerate() {
             assert!(rec.parent.is_none_or(|p| (p as usize) < i));
         }
+    }
+
+    /// The graft-observability split: carried nodes are matchable, structure
+    /// nodes are match paths only. And both accessors describe the SURVIVING
+    /// population: a carrier nobody knows is already gone from the count.
+    #[test]
+    fn carrier_counts_split_carrying_nodes_from_kept_structure() {
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0), wire_worker("http://drained", 0)],
+            vec![
+                node(None, 1, vec![]),        // interior on a live path: kept structure
+                node(Some(0), 2, vec![0, 1]), // carried (by both)
+                node(Some(1), 3, vec![1]),    // carried only by the drained worker
+            ],
+        );
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap();
+        // The drained carrier leaves the worker table; its exclusive node is
+        // pruned as a carrier-less leaf, and the shared node keeps the live
+        // worker as its only carrier.
+        assert_eq!(vetted.worker_count(), 1);
+        assert_eq!(vetted.dropped_workers(), 1);
+        assert_eq!(vetted.carrier_counts(), (1, 1));
     }
 
     /// Pruning must remap parent indices, not just drop entries.
