@@ -75,6 +75,11 @@ const PENDING_BATCH_LIMIT: usize = 1024;
 /// peer becoming available is picked up promptly.
 const PEER_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Depth of the obligation queue feeding the coordinator, sized well past a
+/// fleet's worker count. Overflow falls back as [`KvEventIndex::enqueue_bootstrap`]
+/// describes.
+const BOOTSTRAP_QUEUE_DEPTH: usize = 1024;
+
 /// Passes to skip a peer after a retriable failure.
 ///
 /// Unreachable, vet-failed and non-covering peers are retried after a few
@@ -192,12 +197,283 @@ impl KvIndexMetrics {
     }
 }
 
-/// Obligations for one sweep and the instant their ranks began holding; a
-/// peer's export must be newer to splice.
+/// Obligations handed to the coordinator and the instant their ranks began
+/// holding; a peer's export must be newer to splice.
 struct ObligationBatch {
     obligations: Vec<(KvWorkerId, u64)>,
-    /// Becomes the `freshness_floor` of [`sweep_until_deadline`].
+    /// Folded into [`PendingSweep::freshness_floor`], which the sweep asks with.
     holding_since: Instant,
+    /// Whether this batch may ride a sweep already in flight.
+    late_join: LateJoin,
+}
+
+/// What a batch accepts when it arrives while a sweep is already in flight.
+///
+/// The sweep asked for freshness on behalf of the ranks it started with, so a
+/// batch that arrives afterwards may be delivered against an export predating
+/// its own `holding_since` — which the pump then resolves [`RankOutcome::Gap`].
+/// Whether that is acceptable depends on what the batch has left to spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateJoin {
+    /// Ride the in-flight sweep's snapshot regardless.
+    ///
+    /// Used by discovery, whose workers land during the first fetch; a rank
+    /// that gaps this way still has its one retry.
+    Permitted,
+    /// Wait for a sweep that asks on this batch's behalf.
+    ///
+    /// Used by a gap retry, for which riding along is equivalent to dropping
+    /// it: `gap_retried` caps it at one, and a snapshot taken before the rank
+    /// resumed holding re-gaps by construction. Deferring costs one loop
+    /// iteration, since the coordinator re-enters `take_pending` as soon as it
+    /// has delivered.
+    Refused,
+}
+
+/// Obligations taken off the queue for one sweep, with the freshness every one
+/// of them requires.
+struct PendingSweep {
+    obligations: Vec<(KvWorkerId, u64)>,
+    /// The newest `holding_since` among batches absorbed before the sweep: its
+    /// one snapshot must postdate every rank in it. An `Instant` rather than a
+    /// max age, so each retry's `elapsed()` asks for the same condition
+    /// (`exported_at > floor`).
+    freshness_floor: Instant,
+    /// The newest `holding_since` of every batch folded in, including those
+    /// admitted after the floor froze. What a batch built from this sweep's
+    /// ranks must carry, since it may hold ranks that began holding after the
+    /// floor.
+    newest_holding: Instant,
+    /// Batches that arrived too late for this sweep to have asked on their
+    /// behalf and refused to ride along. Handed back for the next one.
+    deferred: Vec<ObligationBatch>,
+}
+
+impl PendingSweep {
+    /// Fold a batch in before the sweep starts, tightening the floor it will ask
+    /// with.
+    fn absorb(&mut self, batch: ObligationBatch) {
+        self.freshness_floor = self.freshness_floor.max(batch.holding_since);
+        self.fold(batch);
+    }
+
+    /// Add `batch`'s obligations without touching the floor.
+    fn fold(&mut self, batch: ObligationBatch) {
+        self.newest_holding = self.newest_holding.max(batch.holding_since);
+        self.obligations.extend(batch.obligations);
+    }
+
+    /// Fold a batch in after the floor has been frozen — i.e. once the sweep is
+    /// running and its request has already stated what it wants.
+    ///
+    /// Deliberately does NOT tighten the floor: the fetch has already gone out
+    /// under the old one, so raising it here would describe a guarantee this
+    /// sweep never asked for.
+    fn admit_late(&mut self, batch: ObligationBatch) {
+        if batch.late_join == LateJoin::Refused && batch.holding_since > self.freshness_floor {
+            self.deferred.push(batch);
+        } else {
+            self.fold(batch);
+        }
+    }
+
+    /// Keep only obligations a graft could still discharge, once each.
+    ///
+    /// A queued obligation can go stale before its sweep runs — the rank
+    /// resolved, or its worker was removed and re-added — and would buy a
+    /// fleet-wide fetch the pump then discards at its `Pending` gate. And the
+    /// same rank can arrive twice (a coverage retry merged into a sweep that
+    /// already holds it); a duplicate would be delivered alongside that rank's
+    /// own retry and resolve it `Uncovered` before the retry lands.
+    fn retain_graftable(&mut self, tracker: &BootstrapTracker) {
+        // Keyed by epoch alone: the tracker mints epochs from one counter, and
+        // the `epoch_of` check ties each surviving epoch to exactly one rank.
+        let mut seen: HashSet<u64> = HashSet::with_capacity(self.obligations.len());
+        self.obligations.retain(|(rank, epoch)| {
+            tracker.epoch_of(rank) == Some(*epoch)
+                && tracker.state_of(rank) == Some(BootstrapState::Pending)
+                && seen.insert(*epoch)
+        });
+    }
+}
+
+impl From<ObligationBatch> for PendingSweep {
+    fn from(batch: ObligationBatch) -> Self {
+        Self {
+            obligations: batch.obligations,
+            freshness_floor: batch.holding_since,
+            newest_holding: batch.holding_since,
+            deferred: Vec::new(),
+        }
+    }
+}
+
+/// Run bootstrap sweeps one at a time, and let every rank queued while a sweep
+/// is in flight share its snapshot.
+///
+/// A peer snapshot is fleet-wide — one body carries the whole worker table,
+/// every cursor and the whole tree — so one fetch serves every pending rank,
+/// where a sweep per discovered engine would re-download it once per engine.
+/// The fetch itself is the batching window: it outlasts the watch event that
+/// delivers a fleet, so ranks discovered meanwhile join its delivery at no
+/// latency cost.
+///
+/// Sharing is safe because a graft is judged by sequence, not by clock: it
+/// splices only when the rank's live stream resumes at `peer_cursor + 1`, and
+/// each rank is judged on its own, so one whose publisher advanced resolves
+/// [`RankOutcome::Gap`]. A rank the accepted peer does not cover gets one sweep
+/// of its own before it resolves [`RankOutcome::Uncovered`].
+///
+/// Every fetch attempt states [`PendingSweep::freshness_floor`], which speaks
+/// for the ranks the sweep started with. A rank merged in later may be
+/// delivered against an older export; [`LateJoin`] says which batches accept
+/// that.
+async fn bootstrap_coordinator(
+    mut rx: mpsc::Receiver<ObligationBatch>,
+    index: std::sync::Weak<KvEventIndex>,
+    cancel: CancellationToken,
+) {
+    // Obligations already given a second sweep for want of coverage. A rank no
+    // peer covers must not buy a fresh fleet-wide fetch on every pass, so each
+    // gets at most one retry. Keyed by incarnation, so a worker removed and re-added is
+    // not denied its own, and pruned once that incarnation is gone.
+    let mut requeued: HashSet<(KvWorkerId, u64)> = HashSet::new();
+    loop {
+        let Some(mut pending) = take_pending(&mut rx, &cancel).await else {
+            return;
+        };
+
+        // Obligations already taken from the channel are dropped without a
+        // `PumpControl` if this fails, which would normally strand their ranks in
+        // `Pending`. Only reachable once the last `Arc<KvEventIndex>` is gone —
+        // i.e. teardown, where the pump that would have received the message is
+        // gone too and nothing is left to keep ready.
+        let deps = {
+            let Some(index) = index.upgrade() else { return };
+            index.bootstrap_deps()
+        };
+        requeued.retain(|(rank, epoch)| deps.bootstrap.epoch_of(rank) == Some(*epoch));
+        pending.retain_graftable(&deps.bootstrap);
+        if pending.obligations.is_empty() {
+            continue;
+        }
+        let deadline = deps.deadline();
+        let ranks: Vec<KvWorkerId> = pending.obligations.iter().map(|(r, _)| r.clone()).collect();
+
+        // ONE sweep, awaited here rather than spawned — that is what makes this
+        // single-flight. Obligations discovered while it runs pile up in the
+        // channel and are merged below, so they ride this same snapshot.
+        let started = Instant::now();
+        info!(
+            ranks = ranks.len(),
+            peers = deps.peers.len(),
+            deadline_ms = deadline.as_millis(),
+            "kv-bootstrap: sweeping sibling replicas for a tree snapshot",
+        );
+        // Raced against shutdown, which cancels the pump through the same token:
+        // a sweep finishing after it has nobody to deliver to, and would keep
+        // pulling multi-megabyte bodies from siblings for up to the deadline.
+        let result = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = sweep_until_deadline(&deps, &ranks, deadline, pending.freshness_floor) => result,
+        };
+        drop(ranks);
+        let joined = drain_ready(&mut rx, &mut pending);
+        if joined > 0 || !pending.deferred.is_empty() {
+            debug!(
+                joined,
+                deferred = pending.deferred.len(),
+                total = pending.obligations.len(),
+                sweep_ms = started.elapsed().as_millis(),
+                "kv-bootstrap: ranks arriving during the sweep joined its snapshot, \
+                 minus any that need a fresher one",
+            );
+        }
+        // Late arrivals can repeat a rank already here, and anything can have
+        // resolved or been removed while the sweep ran.
+        pending.retain_graftable(&deps.bootstrap);
+
+        // The sweep's coverage check (`covers_any`) only spoke for the ranks it
+        // was given, so a rank merged afterwards may be absent from the accepted
+        // peer's tree — the peer can itself be partially discovered and know one
+        // of our workers but not another. Delivering such a rank into this
+        // snapshot resolves it `Uncovered`, which is TERMINAL, where a sweep that
+        // asked on its behalf would have kept looking for a peer that did cover
+        // it. Give it that look instead.
+        if let SweepResult::Found(ref vetted) = result {
+            let covered = vetted.covered_ranks();
+            let (deliver, retry): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.obligations)
+                .into_iter()
+                .partition(|ob| covered.contains(&ob.0) || !requeued.insert(ob.clone()));
+            pending.obligations = deliver;
+            if !retry.is_empty() {
+                // The newest instant anything here began holding, not the frozen
+                // floor: a rank merged in after the sweep started began holding
+                // after the floor, and asking only for the floor would let its
+                // retry accept an export that predates it. Still not NOW, which
+                // would force the peer into rebuilds these ranks do not need.
+                pending.deferred.push(ObligationBatch {
+                    obligations: retry,
+                    holding_since: pending.newest_holding,
+                    late_join: LateJoin::Permitted,
+                });
+            }
+        }
+
+        // Re-queue via the index rather than a sender this task owns: a
+        // long-lived clone here would hold the channel open forever and kill
+        // the all-senders-dropped exit.
+        let live = index.upgrade();
+        for batch in std::mem::take(&mut pending.deferred) {
+            match &live {
+                // Never folded into this delivery: that would spend the
+                // freshness these ranks asked for.
+                Some(idx) => idx.enqueue_bootstrap(batch),
+                // Teardown: nothing is left to run another sweep, so deliver them
+                // here rather than stranding them.
+                None => pending.obligations.extend(batch.obligations),
+            }
+        }
+        // Not held across the delivery, which would keep the index alive.
+        drop(live);
+
+        deliver_bootstrap(&deps, pending.obligations, result, deadline).await;
+    }
+}
+
+/// Block for the first obligation, then take everything already queued behind it
+/// without waiting.
+///
+/// `None` means stop — cancelled, or every sender dropped with nothing pending.
+async fn take_pending(
+    rx: &mut mpsc::Receiver<ObligationBatch>,
+    cancel: &CancellationToken,
+) -> Option<PendingSweep> {
+    // Block until there is something to do, so an idle fleet costs nothing.
+    let first = tokio::select! {
+        _ = cancel.cancelled() => return None,
+        first = rx.recv() => first?,
+    };
+    let mut pending = PendingSweep::from(first);
+    // Pre-sweep, so these tighten the floor the sweep will ask with rather than
+    // arriving after it has already asked.
+    while let Ok(more) = rx.try_recv() {
+        pending.absorb(more);
+    }
+    Some(pending)
+}
+
+/// Move every immediately-available obligation into `into`, returning how many
+/// ranks were added. Never waits.
+///
+/// Called once the sweep has run, so batches are admitted under the frozen floor
+/// — see [`PendingSweep::admit_late`]. Ranks it defers are not counted as joined.
+fn drain_ready(rx: &mut mpsc::Receiver<ObligationBatch>, into: &mut PendingSweep) -> usize {
+    let before = into.obligations.len();
+    while let Ok(more) = rx.try_recv() {
+        into.admit_late(more);
+    }
+    into.obligations.len() - before
 }
 
 /// A built snapshot with both of its wire encodings.
@@ -328,6 +604,9 @@ pub struct KvEventIndex {
     /// `/server_info` but cannot fit a multi-megabyte body, and every large
     /// snapshot would be booked `unreachable`.
     snapshot_http: reqwest::Client,
+    /// Obligations waiting for the coordinator to fold them into the sweep that
+    /// is in flight, or to start one. See [`bootstrap_coordinator`].
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
     /// Last built snapshot; see [`KvEventIndex::peer_snapshot_body`].
     snapshot_cache: Arc<AsyncMutex<Option<CachedSnapshot>>>,
     /// Worker-sourced `page_size` shared with prefix providers.
@@ -452,6 +731,7 @@ impl KvEventIndex {
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
+        let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
         let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
@@ -461,12 +741,13 @@ impl KvEventIndex {
                 cursors: cursors.clone(),
                 live_workers: live_workers.clone(),
                 bootstrap: Arc::clone(&bootstrap),
+                bootstrap_tx: bootstrap_tx.clone(),
             },
             pump_cancel.clone(),
             rx,
             ctrl_rx,
         ));
-        Arc::new(Self {
+        let index = Arc::new(Self {
             tree,
             maintain_tree,
             subscribers,
@@ -483,9 +764,20 @@ impl KvEventIndex {
             peers,
             ctrl_tx,
             snapshot_http,
+            bootstrap_tx,
             snapshot_cache: Arc::new(AsyncMutex::new(None)),
             block_size_oracle,
-        })
+        });
+        // Same gate as registration, so a coordinator exists exactly when
+        // obligations can be produced.
+        if index.peer_bootstrap_enabled() {
+            tokio::spawn(bootstrap_coordinator(
+                bootstrap_rx,
+                Arc::downgrade(&index),
+                pump_cancel,
+            ));
+        }
+        index
     }
 
     /// Shared handle to the bootstrap tracker. `/readyz` reads it to decide
@@ -884,10 +1176,14 @@ impl KvEventIndex {
             // tasks, though: the connect completes asynchronously, so an export
             // taken between this stamp and the connect can still gap, and the
             // splice check is what catches it.
-            self.spawn_bootstrap(ObligationBatch {
+            let batch = ObligationBatch {
                 obligations: bootstrap_obligations,
                 holding_since: Instant::now(),
-            });
+                late_join: LateJoin::Permitted,
+            };
+            // The stamp travels with the batch, so whichever sweep picks it up
+            // asks for an export newer than it.
+            self.enqueue_bootstrap(batch);
         }
         // Mark only the ranks that have an actual SUB socket. `EngineReportedLoadTable`
         // then rejects missing or stale advertised ranks as a whole worker.
@@ -921,6 +1217,20 @@ impl KvEventIndex {
         self.bootstrap.register(ranks)
     }
 
+    /// Hand `batch` to the coordinator, or sweep it on its own when the queue is
+    /// full or the coordinator is gone.
+    ///
+    /// Never drops it: an obligation nothing owns leaves its ranks `Pending`,
+    /// which holds `/readyz` and holds their batches until the pump's per-rank
+    /// cap overflows. Sweeping un-batched costs a fetch the coordinator would
+    /// have shared, and keeps the freshness the batch asked for.
+    fn enqueue_bootstrap(&self, batch: ObligationBatch) {
+        if let Err(e) = self.bootstrap_tx.try_send(batch) {
+            warn!("kv-bootstrap: batch queue unavailable ({e}); sweeping un-batched");
+            self.spawn_bootstrap(e.into_inner());
+        }
+    }
+
     /// Fetch a snapshot for one batch of obligations from the first peer, in
     /// shuffled order, whose snapshot vets and covers at least one of its ranks,
     /// and hand the result to the pump.
@@ -935,6 +1245,7 @@ impl KvEventIndex {
             let ObligationBatch {
                 obligations,
                 holding_since,
+                late_join: _,
             } = batch;
             let ranks: Vec<KvWorkerId> = obligations.iter().map(|(r, _)| r.clone()).collect();
             let deadline = deps.deadline();
@@ -943,8 +1254,8 @@ impl KvEventIndex {
         });
     }
 
-    /// Clone the handles a sweep needs, so it can run detached without
-    /// borrowing `self`.
+    /// Clone the handles a sweep needs, so it can run detached — or be awaited
+    /// by the coordinator — without borrowing `self`.
     fn bootstrap_deps(&self) -> BootstrapDeps {
         BootstrapDeps {
             http: self.snapshot_http.clone(),
@@ -1054,7 +1365,8 @@ impl KvEventIndex {
 }
 
 /// The handles a bounded peer sweep needs, cloned out of [`KvEventIndex`] so the
-/// sweep can run detached without borrowing `self`.
+/// sweep can run detached — or be awaited by the coordinator — without
+/// borrowing `self`.
 struct BootstrapDeps {
     http: reqwest::Client,
     peers: Arc<PeerRegistry>,
@@ -1506,6 +1818,9 @@ struct PumpDeps {
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
     bootstrap: Arc<BootstrapTracker>,
+    /// Obligation queue, so a gap-discarded rank can be handed back for another
+    /// sweep instead of staying cold with budget unspent.
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
 }
 
 /// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
@@ -1529,12 +1844,14 @@ async fn pump_loop(
         cursors,
         live_workers,
         bootstrap,
+        bootstrap_tx,
     } = deps;
     let pump_state = PumpState {
         tree: &tree,
         cursors: &cursors,
         tally: &tally,
         bootstrap: &bootstrap,
+        bootstrap_tx: &bootstrap_tx,
         live_workers: &live_workers,
     };
 
@@ -1746,7 +2063,13 @@ async fn pump_loop(
                             "kv-bootstrap: sequence gap between snapshot and live stream; \
                              discarding snapshot state for this rank to avoid stale cache entries",
                         );
-                        discard_graft(&pump_state, &worker, RankOutcome::Gap);
+                        // Held, not applied: `resolve_gap` either replays it after
+                        // clearing, or keeps it for the retry's graft.
+                        held.entry(worker.clone())
+                            .or_default()
+                            .push_back((seq, batch));
+                        resolve_gap(&pump_state, &mut held, &worker);
+                        continue;
                     } else {
                         // The deferred check passed: this rank's grafted state is
                         // now proven continuous with its live stream, which is the
@@ -1767,6 +2090,9 @@ struct PumpState<'a> {
     tally: &'a EventTally,
     bootstrap: &'a BootstrapTracker,
     live_workers: &'a Mutex<HashSet<KvWorkerId>>,
+    /// Obligation queue, so the graft path can hand a gapped rank back for
+    /// another sweep. See [`resolve_gap`].
+    bootstrap_tx: &'a mpsc::Sender<ObligationBatch>,
 }
 
 /// Whether a live stream whose first batch is `first_seq` leaves a hole after
@@ -1920,6 +2246,63 @@ fn still_owed(st: &PumpState<'_>, rank: &KvWorkerId, epoch: u64) -> bool {
         && st.bootstrap.state_of(rank) == Some(BootstrapState::Pending)
 }
 
+/// Discard a graft whose live stream did not join its watermark, then hand the
+/// rank back for one more sweep, or fail it cold when no retry is allowed.
+///
+/// A gap is the costliest failure: a snapshot was fetched, grafted, then thrown
+/// away. A fresher snapshot usually splices, so the tracker allows one retry per
+/// rank.
+///
+/// PRECONDITION: every live batch the rank has received is in `held` and none
+/// has been applied. That is what lets a retry start from exactly the shape a
+/// first attempt does — no tree state, no cursor, every delta held. Applying
+/// the queue first would leave live deltas UNDER the retry's graft, whose seeded
+/// cursor then filters their later removals as already reflected (a permanent
+/// false hit on the success path), and any failure path's `clear_worker` would
+/// wipe them.
+///
+/// The verdict is tallied only when final: a granted retry records nothing
+/// here, and the retry's own resolution records the rank's one `RankOutcome`.
+///
+/// The retry is stamped now and marked [`LateJoin::Refused`], so only a sweep
+/// that asks for an export newer than the gap can take it.
+fn resolve_gap(
+    st: &PumpState<'_>,
+    held: &mut HashMap<KvWorkerId, VecDeque<(i64, KvEventBatch)>>,
+    rank: &KvWorkerId,
+) {
+    // `Failed` is the state a gap leaves, and the only one `retry_after_gap`
+    // grants from. Set immediately before it, so `/readyz` has no room to read
+    // a retried rank as terminal.
+    st.bootstrap.set(rank, BootstrapState::Failed);
+    if let Some(obligation) = st.bootstrap.retry_after_gap(rank) {
+        let batch = ObligationBatch {
+            obligations: vec![obligation],
+            holding_since: Instant::now(),
+            late_join: LateJoin::Refused,
+        };
+        match st.bootstrap_tx.try_send(batch) {
+            Ok(()) => {
+                // The discarded graft goes, untallied; `held` stays for the
+                // retry's graft.
+                st.tree.clear_worker(rank);
+                st.cursors.lock().remove(rank);
+                debug!(worker = ?rank, "kv-bootstrap: gapped rank re-queued for another sweep");
+                return;
+            }
+            // A `Pending` rank nobody owns holds its batches until the
+            // per-rank cap overflows, so fail it cold instead.
+            Err(e) => {
+                warn!("kv-bootstrap: could not re-queue gapped rank ({e}); leaving it cold");
+            }
+        }
+    }
+    discard_graft(st, rank, RankOutcome::Gap);
+    for (seq, batch) in held.remove(rank).unwrap_or_default() {
+        apply_batch(st.tree, st.cursors, st.tally, rank, seq, &batch);
+    }
+}
+
 /// Graft a vetted snapshot, seed cursors, then release held batches.
 ///
 /// Runs on the pump so it is the sole tree writer for the duration.
@@ -1996,7 +2379,9 @@ fn apply_snapshot(
                     "kv-bootstrap: sequence gap between snapshot and live stream; \
                      running cold to avoid stale cache entries",
                 );
-                fail_rank(st, held, &rank, false, RankOutcome::Gap);
+                // `held` still holds the queue: `resolve_gap` replays it after
+                // clearing, or keeps it for the retry's graft.
+                resolve_gap(st, held, &rank);
                 continue;
             }
             Some(_) => {}
@@ -2047,6 +2432,202 @@ mod tests {
             events,
             attn_dp_rank: None,
         }
+    }
+
+    fn obligation(n: u32) -> ObligationBatch {
+        discovery_batch(n, Instant::now())
+    }
+
+    fn discovery_batch(n: u32, holding_since: Instant) -> ObligationBatch {
+        ObligationBatch {
+            obligations: vec![(worker_id(&format!("http://w{n}:30000"), 0), n as u64)],
+            holding_since,
+            late_join: LateJoin::Permitted,
+        }
+    }
+
+    /// A discovery burst is taken in one go, so one fleet-wide snapshot serves
+    /// every rank instead of one fetch per worker.
+    #[tokio::test]
+    async fn take_pending_takes_the_whole_queued_burst() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        for n in 0..8 {
+            tx.send(obligation(n)).await.unwrap();
+        }
+        let got = take_pending(&mut rx, &cancel).await.expect("obligations");
+        assert_eq!(got.obligations.len(), 8, "all eight are taken together");
+    }
+
+    /// Absorbing a burst must adopt the STRICTEST freshness in it: the sweep
+    /// fetches once for all of them, so a snapshot older than the last rank to
+    /// start holding cannot splice for that rank.
+    #[tokio::test]
+    async fn take_pending_adopts_the_newest_holding_instant() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let base = Instant::now();
+        let newest = base + Duration::from_millis(300);
+        tx.send(discovery_batch(0, base)).await.unwrap();
+        tx.send(discovery_batch(1, newest)).await.unwrap();
+        tx.send(discovery_batch(2, base + Duration::from_millis(100)))
+            .await
+            .unwrap();
+
+        let got = take_pending(&mut rx, &cancel).await.expect("obligations");
+        assert_eq!(got.obligations.len(), 3);
+        assert_eq!(
+            got.freshness_floor, newest,
+            "the floor must be the newest holding instant, not the first seen",
+        );
+    }
+
+    /// It returns as soon as one obligation is queued, without debouncing.
+    #[tokio::test]
+    async fn take_pending_does_not_wait() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        tx.send(obligation(1)).await.unwrap();
+        let started = Instant::now();
+        let got = take_pending(&mut rx, &cancel).await.expect("obligations");
+        let elapsed = started.elapsed();
+        assert_eq!(got.obligations.len(), 1);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "returned in {elapsed:?}; must not debounce",
+        );
+    }
+
+    /// The load-bearing behaviour: ranks discovered WHILE a sweep is in flight
+    /// are merged into that sweep's delivery, so they ride its snapshot rather
+    /// than waiting for a second fetch.
+    #[tokio::test]
+    async fn drain_ready_merges_arrivals_from_during_the_sweep() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        tx.send(obligation(0)).await.unwrap();
+        let mut pending = take_pending(&mut rx, &cancel).await.expect("obligations");
+        assert_eq!(pending.obligations.len(), 1);
+
+        // Stand in for the fetch: more workers show up while it is running.
+        for n in 1..6 {
+            tx.send(obligation(n)).await.unwrap();
+        }
+        let joined = drain_ready(&mut rx, &mut pending);
+        assert_eq!(joined, 5, "late arrivals are reported");
+        assert_eq!(
+            pending.obligations.len(),
+            6,
+            "and merged into the same delivery",
+        );
+        assert!(
+            pending.deferred.is_empty(),
+            "discovery rides along rather than waiting for a sweep of its own",
+        );
+    }
+
+    /// A gap retry landing mid-sweep must not be spent on that sweep's snapshot.
+    #[tokio::test]
+    async fn drain_ready_defers_a_gap_retry_the_sweep_cannot_speak_for() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let base = Instant::now();
+        tx.send(discovery_batch(0, base)).await.unwrap();
+        let mut pending = take_pending(&mut rx, &cancel).await.expect("obligations");
+
+        let rank = worker_id("http://gapped:30000", 0);
+        tx.send(ObligationBatch {
+            obligations: vec![(rank.clone(), 7)],
+            holding_since: base + Duration::from_millis(200),
+            late_join: LateJoin::Refused,
+        })
+        .await
+        .unwrap();
+
+        let joined = drain_ready(&mut rx, &mut pending);
+        assert_eq!(joined, 0, "a deferred batch is not counted as joined");
+        assert_eq!(
+            pending.obligations.len(),
+            1,
+            "and is not delivered into this sweep",
+        );
+        assert_eq!(pending.deferred.len(), 1, "it is handed to the next one");
+        assert_eq!(pending.deferred[0].obligations[0].0, rank);
+    }
+
+    /// A rank merged in mid-sweep began holding after the frozen floor, so
+    /// anything re-queued from this sweep must ask for at least its instant.
+    /// The floor itself stays put: the request has already gone out under it.
+    #[tokio::test]
+    async fn late_admissions_raise_newest_holding_but_not_the_floor() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let base = Instant::now();
+        tx.send(discovery_batch(0, base)).await.unwrap();
+        let mut pending = take_pending(&mut rx, &cancel).await.expect("obligations");
+
+        let late = base + Duration::from_secs(2);
+        tx.send(discovery_batch(1, late)).await.unwrap();
+        drain_ready(&mut rx, &mut pending);
+        assert_eq!(
+            pending.freshness_floor, base,
+            "the floor is frozen once the sweep is in flight",
+        );
+        assert_eq!(pending.newest_holding, late);
+    }
+
+    /// Only obligations a graft could still discharge reach a sweep: a rank that
+    /// already resolved, or whose incarnation is gone, would cost a fleet-wide
+    /// fetch for nothing, and a duplicate would defeat its own coverage retry.
+    #[test]
+    fn retain_graftable_keeps_each_pending_incarnation_once() {
+        let pending_rank = worker_id("http://pending:30000", 0);
+        let resolved = worker_id("http://resolved:30000", 0);
+        let reregistered = worker_id("http://reregistered:30000", 0);
+        let ranks = [pending_rank.clone(), resolved.clone(), reregistered.clone()];
+        let tracker = pending_tracker(&ranks);
+        let obs = obligations(&tracker, &ranks);
+        tracker.set(&resolved, BootstrapState::Recovered);
+        let stale_epoch = tracker.epoch_of(&reregistered).unwrap();
+        tracker.forget(std::slice::from_ref(&reregistered));
+        tracker.register(std::slice::from_ref(&reregistered));
+
+        let mut obligations = obs.clone();
+        obligations.push(obs[0].clone());
+        let mut sweep = PendingSweep::from(ObligationBatch {
+            obligations,
+            holding_since: Instant::now(),
+            late_join: LateJoin::Permitted,
+        });
+        sweep.retain_graftable(&tracker);
+
+        assert_eq!(
+            sweep.obligations,
+            vec![obs[0].clone()],
+            "resolved, superseded (epoch {stale_epoch}) and duplicate obligations are dropped",
+        );
+    }
+
+    /// The refusal is about freshness, not about being a retry: a retry the
+    /// sweep's own floor already covers has nothing to gain from waiting.
+    #[tokio::test]
+    async fn drain_ready_admits_a_retry_the_floor_already_covers() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let base = Instant::now();
+        tx.send(discovery_batch(0, base)).await.unwrap();
+        let mut pending = take_pending(&mut rx, &cancel).await.expect("obligations");
+
+        tx.send(ObligationBatch {
+            obligations: vec![(worker_id("http://early:30000", 0), 7)],
+            holding_since: base - Duration::from_millis(200),
+            late_join: LateJoin::Refused,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(drain_ready(&mut rx, &mut pending), 1);
+        assert!(pending.deferred.is_empty());
     }
 
     /// One snapshot fetch never consumes the whole bootstrap deadline, so the
@@ -2936,6 +3517,39 @@ mod tests {
         );
     }
 
+    /// Nothing queued means nothing added, and no spinning.
+    #[tokio::test]
+    async fn drain_ready_on_empty_queue_adds_nothing() {
+        let (_tx, mut rx) = mpsc::channel::<ObligationBatch>(4);
+        let mut pending = PendingSweep::from(obligation(0));
+        assert_eq!(drain_ready(&mut rx, &mut pending), 0);
+        assert_eq!(pending.obligations.len(), 1);
+    }
+
+    /// Cancellation while idle ends the coordinator rather than parking forever.
+    #[tokio::test]
+    async fn take_pending_stops_on_cancel() {
+        let (_tx, mut rx) = mpsc::channel::<ObligationBatch>(4);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            take_pending(&mut rx, &cancel).await.is_none(),
+            "cancelled coordinator stops",
+        );
+    }
+
+    /// All senders dropped with nothing pending ends the coordinator too.
+    #[tokio::test]
+    async fn take_pending_stops_when_senders_drop() {
+        let (tx, mut rx) = mpsc::channel::<ObligationBatch>(4);
+        let cancel = CancellationToken::new();
+        drop(tx);
+        assert!(
+            take_pending(&mut rx, &cancel).await.is_none(),
+            "closed channel stops the coordinator",
+        );
+    }
+
     /// Bundle of plumbing returned by `spawn_pump` so individual tests
     /// can destructure just the bits they need.
     struct PumpHarness {
@@ -2950,6 +3564,8 @@ mod tests {
         tx: mpsc::Sender<WorkerEvent>,
         pump: JoinHandle<()>,
         ctrl_tx: mpsc::Sender<PumpControl>,
+        /// Obligations the pump handed back, e.g. a gap-driven retry.
+        bootstrap_rx: mpsc::Receiver<ObligationBatch>,
     }
 
     /// Build a tree + cursors + live-set wired through `pump_loop` with
@@ -2973,6 +3589,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let (tx, rx) = mpsc::channel(4);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(4);
+        // Real queue so a gap-driven re-queue is observable rather than dropped.
+        let (bootstrap_tx, bootstrap_rx) = mpsc::channel(16);
         let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
@@ -2982,6 +3600,7 @@ mod tests {
                 cursors: cursors.clone(),
                 live_workers: live_set.clone(),
                 bootstrap: bootstrap.clone(),
+                bootstrap_tx: bootstrap_tx.clone(),
             },
             cancel.clone(),
             rx,
@@ -2997,6 +3616,7 @@ mod tests {
             tx,
             pump,
             ctrl_tx,
+            bootstrap_rx,
         }
     }
 
@@ -3211,8 +3831,8 @@ mod tests {
         drop(h.ctrl_tx);
         h.pump.await.unwrap();
 
-        // A gapped rank is terminal.
-        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        // A gapped rank is handed back for its one retry, so it is Pending.
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Pending));
         assert!(
             !h.tree
                 .match_prefix(None, &[100, 200])
@@ -3220,10 +3840,183 @@ mod tests {
                 .contains(&id),
             "snapshot state must be discarded for a gapped rank",
         );
-        // The live stream still applies: cold, not broken.
-        assert!(h.tree.match_prefix(None, &[42]).workers().contains(&id));
-        // Every rank is terminal, so readiness no longer waits on this one.
-        assert!(tracker.settled());
+        // The live batch is held for the retry's graft, like any Pending rank's;
+        // `abandoned_gap_retry_replays_every_held_batch` covers its release.
+        assert_eq!(h.tree.match_prefix(None, &[42]).matched_blocks, 0);
+        assert!(h.cursors.lock().get(&id).is_none());
+        // Readiness waits: the gapped rank is Pending for its retry, so the
+        // tracker is unsettled until that resolves or the deadline expires.
+        // Warming the tree is preferred over opening `/readyz` on a cold rank.
+        assert!(!tracker.settled());
+    }
+
+    /// A gap is the costliest failure — a snapshot was fetched, grafted, then
+    /// thrown away. So the rank is handed back for one more sweep instead of
+    /// staying cold with budget unspent. The one-retry cap is covered by
+    /// `a_second_gap_fails_the_rank_cold_and_replays_its_batches`.
+    #[tokio::test]
+    async fn pump_requeues_a_gapped_rank_once() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let mut h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        // Watermark 5, first live batch seq 9 — 6..8 lost, so this gaps.
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 9,
+            batch: batch(vec![stored(None, vec![42])]),
+        })
+        .await
+        .unwrap();
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: obligations(&tracker, std::slice::from_ref(&id)),
+                vetted: Box::new(vetted_for(&id, 5)),
+            })
+            .await
+            .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        let requeued = h.bootstrap_rx.try_recv().expect("gapped rank re-queued");
+        assert_eq!(requeued.obligations.len(), 1);
+        assert_eq!(
+            requeued.obligations[0].0, id,
+            "the gapped rank itself is handed back",
+        );
+        assert_eq!(
+            requeued.late_join,
+            LateJoin::Refused,
+            "a retry must not be spent on a snapshot fetched before the gap",
+        );
+        assert_eq!(
+            tracker.state_of(&id),
+            Some(BootstrapState::Pending),
+            "back to Pending so the next sweep may graft onto it",
+        );
+    }
+
+    /// A retried rank must reach its second graft in the same shape as its
+    /// first: nothing applied, every delta held. If the first attempt's held
+    /// batches were applied before the retry, the retry's graft lands on top of
+    /// them and its seeded cursor then filters their later removals as already
+    /// reflected — so a block the engine has evicted stays attributed to the
+    /// rank for good.
+    #[tokio::test]
+    async fn gap_retry_graft_does_not_resurrect_a_block_the_stream_removed() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let mut h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        // seq 7 stores X. Held, because the rank is Pending.
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 7,
+            batch: batch(vec![stored(None, vec![500])]),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // First graft watermarked 5: seq 6 is missing, so this gaps and retries.
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: obligations(&tracker, std::slice::from_ref(&id)),
+                vetted: Box::new(vetted_for(&id, 5)),
+            })
+            .await
+            .unwrap();
+        let retry = h.bootstrap_rx.recv().await.expect("gapped rank re-queued");
+
+        // seq 8 evicts X while the retry is in flight.
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 8,
+            batch: batch(vec![KvCacheEvent::BlockRemoved(BlockRemoved {
+                block_hashes: vec![500],
+                medium: None,
+            })]),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The retry's peer had applied both, so its export no longer holds X.
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: retry.obligations,
+                vetted: Box::new(vetted_for(&id, 8)),
+            })
+            .await
+            .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Recovered));
+        assert!(
+            !h.tree.match_prefix(None, &[500]).workers().contains(&id),
+            "the engine evicted X at seq 8; the rank must not still own it",
+        );
+        assert_eq!(rank_count(&tracker, "warm"), 1);
+        assert_eq!(
+            rank_count(&tracker, "gap"),
+            0,
+            "a retried gap is not a verdict; the retry's outcome is the rank's one count",
+        );
+    }
+
+    /// A retry that fails must not cost the rank the deltas it held before it:
+    /// abandoning replays every batch the rank has received, both attempts'.
+    #[tokio::test]
+    async fn abandoned_gap_retry_replays_every_held_batch() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let mut h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 7,
+            batch: batch(vec![stored(None, vec![500])]),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: obligations(&tracker, std::slice::from_ref(&id)),
+                vetted: Box::new(vetted_for(&id, 5)),
+            })
+            .await
+            .unwrap();
+        let retry = h.bootstrap_rx.recv().await.expect("gapped rank re-queued");
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 8,
+            batch: batch(vec![stored(None, vec![600])]),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.ctrl_tx
+            .send(PumpControl::AbandonBootstrap {
+                obligations: retry.obligations,
+            })
+            .await
+            .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        for block in [500, 600] {
+            assert!(
+                h.tree.match_prefix(None, &[block]).workers().contains(&id),
+                "live block {block} must survive the retry's abandonment",
+            );
+        }
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(8));
+        assert_eq!(rank_count(&tracker, "abandoned"), 1);
+        assert_eq!(rank_count(&tracker, "gap"), 0);
     }
 
     /// Same gap, detected on the *immediate* path: the batch is already held
@@ -3257,7 +4050,7 @@ mod tests {
         drop(h.ctrl_tx);
         h.pump.await.unwrap();
 
-        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Pending));
         assert!(
             !h.tree
                 .match_prefix(None, &[100, 200])
@@ -3265,7 +4058,51 @@ mod tests {
                 .contains(&id),
             "snapshot state must be discarded for a gapped rank",
         );
+        // Still held for the retry's graft, not replayed under it.
+        assert_eq!(h.tree.match_prefix(None, &[42]).matched_blocks, 0);
+    }
+
+    /// With the retry already spent, a gap resolves cold: graft discarded, live
+    /// deltas replayed, one `gap`.
+    #[tokio::test]
+    async fn a_second_gap_fails_the_rank_cold_and_replays_its_batches() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        // Spend the one retry up front.
+        tracker.set(&id, BootstrapState::Failed);
+        let retried = tracker
+            .retry_after_gap(&id)
+            .expect("first retry is granted");
+        let mut h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 9,
+            batch: batch(vec![stored(None, vec![42])]),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: vec![retried],
+                vetted: Box::new(vetted_for(&id, 5)),
+            })
+            .await
+            .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        assert!(h.bootstrap_rx.try_recv().is_err(), "no second retry");
+        assert!(!h
+            .tree
+            .match_prefix(None, &[100, 200])
+            .workers()
+            .contains(&id));
         assert!(h.tree.match_prefix(None, &[42]).workers().contains(&id));
+        assert_eq!(rank_count(&tracker, "gap"), 1);
     }
 
     /// The gap boundary, both directions, on both the deferred and the held path.
