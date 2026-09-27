@@ -247,7 +247,7 @@ class TestDpCpGather(CustomTestCase):
                 # A layer in the middle of the model: its steps come from the
                 # declarations, the modes only give the layer facts.
                 communicator = comm.LayerCommunicator(
-                    layer_scatter_modes=SimpleNamespace(
+                    layer_facts=SimpleNamespace(
                         is_first_layer=False,
                         is_last_layer=False,
                         is_layer_sparse=sparse,

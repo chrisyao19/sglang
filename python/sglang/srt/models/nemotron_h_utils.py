@@ -5,10 +5,9 @@ from typing import Optional
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     LayerStage,
     Layout,
-    ScatterMode,
     StageDecl,
     StageInput,
     StageKind,
@@ -100,25 +99,6 @@ def layer_stage(pattern: str, layer_idx: int) -> LayerStage:
     )
 
 
-def _build_layer_scatter_modes(
-    is_sparse: bool = False, is_last_layer: bool = False
-) -> LayerScatterModes:
-    scatter_mlp = is_sparse and not get_moe_a2a_backend().is_none()
-    mlp_mode = ScatterMode.SCATTERED if scatter_mlp else ScatterMode.FULL
-    middle_residual_mode = (
-        ScatterMode.SCATTERED if scatter_mlp else ScatterMode.TP_ATTN_FULL
-    )
-    return LayerScatterModes(
-        layer_input_mode=ScatterMode.TP_ATTN_FULL,
-        attn_mode=ScatterMode.TP_ATTN_FULL,
-        mlp_mode=mlp_mode,
-        middle_residual_mode=middle_residual_mode,
-        layer_output_mode=ScatterMode.TP_ATTN_FULL,
-        is_layer_sparse=is_sparse,
-        is_last_layer=is_last_layer,
-    )
-
-
 def make_layer_communicator(
     layer_norm: RMSNorm, *, pattern: str, layer_idx: int
 ) -> LayerCommunicator:
@@ -127,8 +107,9 @@ def make_layer_communicator(
     stage = layer_stage(pattern, layer_idx)
     for_attn = stage.kind is StageKind.ATTENTION
     return LayerCommunicator(
-        layer_scatter_modes=_build_layer_scatter_modes(
-            pattern[layer_idx] == MOE, is_last_layer=layer_idx == len(pattern) - 1
+        layer_facts=LayerFacts(
+            is_layer_sparse=pattern[layer_idx] == MOE,
+            is_last_layer=layer_idx == len(pattern) - 1,
         ),
         input_layernorm=layer_norm if for_attn else None,
         post_attention_layernorm=None if for_attn else layer_norm,
