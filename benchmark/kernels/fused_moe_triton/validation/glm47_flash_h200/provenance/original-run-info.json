@@ -1,0 +1,27 @@
+{
+  "gpu": "NVIDIA H200",
+  "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "triton": "3.7.1",
+  "ray": "2.58.0",
+  "sglang-kernel": "0.4.7",
+  "flashinfer-python": "0.6.18",
+  "sglang_file": "/sgl-workspace/sglang/python/sglang/__init__.py",
+  "filename": "E=65,N=1536,device_name=NVIDIA_H200.json",
+  "triton_dir": "triton_3_7_1",
+  "commit": "1f6ce4b0686232fce5feb0d0d841df7d9bcabc02",
+  "git_status": "",
+  "shape": {
+    "num_experts": 65,
+    "topk": 4,
+    "hidden_size": 2048,
+    "shard_intermediate_size": 3072,
+    "dtype": "torch.bfloat16",
+    "block_shape": null,
+    "architecture": "Glm4MoeLiteForCausalLM",
+    "num_layers": 47,
+    "dense_layers": 1
+  },
+  "triton_cache": "/workspace/h200-glm47-flash/triton-cache"
+}
